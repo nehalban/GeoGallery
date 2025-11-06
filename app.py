@@ -13,138 +13,96 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class PhotoLocationSorter:
-    photo_extensions = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.raw', '.cr2', '.nef', '.arw', '.heic'}  # Supported photo file extensions
-    api_request_delay = 0.1  # Delay between API requests to respect rate limits
-    google_api_key = API_KEY  # Set to None if you don't want to use Google API
-    def __init__(self, source_folder):
+    photo_extensions = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.raw', '.cr2', '.nef', '.arw', '.heic'}
+    
+    def __init__(self, source_folder, google_api_key=None):
         self.source_folder = Path(source_folder)
+        self.google_api_key = google_api_key or API_KEY if API_KEY != "YOUR_GOOGLE_MAPS_API_KEY" else None
+        
+        # Lazy caches - only populated as needed
         self.location_cache = {}  # Cache for GPS coordinates
+        self.date_cache = {}  # Cache for dates
         self.geocoding_cache = {}  # Cache for reverse geocoding results
         
-    def extract_tags(self, image_path):
-        """Extract relevant EXIF data - GPS location and time from an image file."""
+    def _extract_exif_data(self, image_path):
+        """Extract both GPS coordinates and date from EXIF data in a single pass."""
         try:
             with open(image_path, 'rb') as f:
-                tags = exifread.process_file(f, details=False, extract_thumbnail=False)
-            relevant_tags = {k: v for k, v in tags.items() if k.startswith('GPS') or k in ['EXIF DateTimeOriginal', 'EXIF DateTime', 'Image DateTime']}
-            logger.info(f"Extracted EXIF data from {image_path}: {relevant_tags}")
-
-            return relevant_tags
-        except Exception as e:
-            logger.warning(f"Error reading EXIF from {image_path}: {e}")
-            return {}
-        
-    def gps_coordinates_from_tags(self, tags):
-        """Extract GPS coordinates from EXIF tags."""
-        try:
+                # Extract all relevant tags in one pass
+                tags = exifread.process_file(
+                    f, 
+                    details=False, 
+                    extract_thumbnail=False
+                )
+            
+            # Extract GPS coordinates
+            coordinates = None
             gps_lat = tags.get('GPS GPSLatitude')
             gps_lat_ref = tags.get('GPS GPSLatitudeRef')
             gps_lon = tags.get('GPS GPSLongitude')
             gps_lon_ref = tags.get('GPS GPSLongitudeRef')
             
-            if not all([gps_lat, gps_lat_ref, gps_lon, gps_lon_ref]):
-                return None
-            
-            # Convert GPS coordinates to decimal degrees
-            lat = self._convert_to_degrees(gps_lat)
-            if gps_lat_ref.values[0] != 'N':
-                lat = -lat
-                
-            lon = self._convert_to_degrees(gps_lon)
-            if gps_lon_ref.values[0] != 'E':
-                lon = -lon
-                
-            # Round to reduce precision for grouping (approximately 11m accuracy)
-            return (round(lat, 4), round(lon, 4))
-        
-        except Exception as e:
-            logger.warning(f"Error extracting GPS from tags: {e}")
-            return None
-    '''def extract_gps_coordinates(self, image_path):
-        """Extract GPS coordinates from image EXIF data efficiently."""
-        try:
-            with open(image_path, 'rb') as f:
-                # Method 1: Use details=False and filter only GPS tags
-                # This is the most efficient approach
-                tags = exifread.process_file(f, details=False, extract_thumbnail=False, stop_tag='GPSLongitude', builtin_types=True)
-
-                # Filter to only GPS tags we need
-                gps_tags = {k: v for k, v in tags.items() if k.startswith('GPS') and 
-                           k in ['GPS GPSLatitude', 'GPS GPSLatitudeRef', 
-                                'GPS GPSLongitude', 'GPS GPSLongitudeRef']}
-            
-            # Check if GPS data exists
-            gps_lat = gps_tags.get('GPS GPSLatitude')
-            gps_lat_ref = gps_tags.get('GPS GPSLatitudeRef')
-            gps_lon = gps_tags.get('GPS GPSLongitude')
-            gps_lon_ref = gps_tags.get('GPS GPSLongitudeRef')
-            
-            if not all([gps_lat, gps_lat_ref, gps_lon, gps_lon_ref]):
-                return None
-                
-            # Convert GPS coordinates to decimal degrees
-            lat = self._convert_to_degrees(gps_lat)
-            if gps_lat_ref.values[0] != 'N':
-                lat = -lat
-                
-            lon = self._convert_to_degrees(gps_lon)
-            if gps_lon_ref.values[0] != 'E':
-                lon = -lon
-                
-            # Round to reduce precision for grouping (approximately 11m accuracy)
-            return (round(lat, 4), round(lon, 4))
-        
-        except Exception as e:
-            logger.warning(f"Error extracting GPS from {image_path}: {e}")
-            return None
-    '''
-    def _convert_to_degrees(self, value):
-        """Convert GPS coordinates from DMS to decimal degrees."""
-        d, m, s = value.values
-        return float(d) + float(m)/60.0 + float(s)/3600.0
-    
-    def date_time_from_tags(self, tags, image_path):
-        """Extract date and time from EXIF tags."""
-        date_tags = ['EXIF DateTimeOriginal', 'EXIF DateTime', 'Image DateTime']
-        
-        for tag_name in date_tags:
-            if tag_name in tags:
-                date_str = str(tags[tag_name])
+            if all([gps_lat, gps_lat_ref, gps_lon, gps_lon_ref]):
                 try:
-                    return datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
-                except ValueError:
-                    continue
-        
-        # Fallback to file modification time
-        return datetime.fromtimestamp(os.path.getmtime(image_path))
-    
-
-    '''
-    # ---------------check this function-----------------
-    def extract_date_taken(self, image_path):
-        """Extract the date the photo was taken."""
-        try:
-            with open(image_path, 'rb') as f:
-                tags = exifread.process_file(f)
-                
-            # Try different date tags
+                    # Convert GPS coordinates to decimal degrees
+                    lat = self._convert_to_degrees(gps_lat)
+                    if gps_lat_ref.values[0] != 'N':
+                        lat = -lat
+                        
+                    lon = self._convert_to_degrees(gps_lon)
+                    if gps_lon_ref.values[0] != 'E':
+                        lon = -lon
+                        
+                    # Round to reduce precision for grouping (approximately 11m accuracy)
+                    coordinates = (round(lat, 4), round(lon, 4))
+                except Exception as e:
+                    logger.warning(f"Error converting GPS coordinates for {image_path.name}: {e}")
+            
+            # Extract date
+            date_taken = None
             date_tags = ['EXIF DateTimeOriginal', 'EXIF DateTime', 'Image DateTime']
             
             for tag_name in date_tags:
                 if tag_name in tags:
                     date_str = str(tags[tag_name])
                     try:
-                        return datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+                        date_taken = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+                        break
                     except ValueError:
                         continue
             
-            # Fallback to file modification time
-            return datetime.fromtimestamp(os.path.getmtime(image_path))
+            # Fallback to file modification time if no EXIF date
+            if date_taken is None:
+                date_taken = datetime.fromtimestamp(os.path.getmtime(image_path))
+            
+            return coordinates, date_taken
             
         except Exception as e:
-            logger.warning(f"Error extracting date from {image_path}: {e}")
-            return datetime.fromtimestamp(os.path.getmtime(image_path))
-    '''
+            logger.warning(f"Error reading EXIF from {image_path.name}: {e}")
+            # Return fallback values
+            return None, datetime.fromtimestamp(os.path.getmtime(image_path))
+    
+    def get_location_lazy(self, image_path):
+        """Get GPS coordinates with lazy caching."""
+        if image_path not in self.location_cache:
+            coordinates, date_taken = self._extract_exif_data(image_path)
+            self.location_cache[image_path] = coordinates
+            self.date_cache[image_path] = date_taken
+        return self.location_cache[image_path]
+    
+    def get_date_lazy(self, image_path):
+        """Get date with lazy caching."""
+        if image_path not in self.date_cache:
+            coordinates, date_taken = self._extract_exif_data(image_path)
+            self.location_cache[image_path] = coordinates
+            self.date_cache[image_path] = date_taken
+        return self.date_cache[image_path]
+    
+    def _convert_to_degrees(self, value):
+        """Convert GPS coordinates from DMS to decimal degrees."""
+        d, m, s = value.values
+        return float(d) + float(m)/60.0 + float(s)/3600.0
+    
     @staticmethod
     def are_locations_same(coord1, coord2, tolerance=0.01):
         """Check if two GPS coordinates are at the same location within tolerance."""
@@ -156,26 +114,25 @@ class PhotoLocationSorter:
         
         return lat_diff <= tolerance and lon_diff <= tolerance
     
-
-    #read hereon!!! -------------------
     def find_location_group_end(self, photos, start_index):
         """Use binary search technique to find the end of a location group."""
         if start_index >= len(photos):
             return start_index
         
-        start_location = self.location_cache.get(photos[start_index])
+        start_location = self.get_location_lazy(photos[start_index])
+        
+        # If no location data, treat as single-item group
         if start_location is None:
             return start_index + 1
         
-        # Binary search to find the end of the group
+        # Exponential search to find upper bound
         left = start_index + 1
         right = len(photos)
-        step = 8  # Start with 8th photo as suggested
+        step = 8  # Start with 8th photo
         
-        # First, find an upper bound using exponential search
         current = start_index + step
         while current < len(photos):
-            current_location = self.location_cache.get(photos[current])
+            current_location = self.get_location_lazy(photos[current])
             
             if not self.are_locations_same(start_location, current_location):
                 right = current
@@ -185,10 +142,10 @@ class PhotoLocationSorter:
             step *= 2
             current = start_index + step
         
-        # Now binary search between left and right
+        # Binary search between left and right
         while left < right:
             mid = (left + right) // 2
-            mid_location = self.location_cache.get(photos[mid])
+            mid_location = self.get_location_lazy(photos[mid])
             
             if self.are_locations_same(start_location, mid_location):
                 left = mid + 1
@@ -209,8 +166,55 @@ class PhotoLocationSorter:
         
         return f"{abs(lat):.4f}{lat_dir}_{abs(lon):.4f}{lon_dir}"
     
+    def get_location_name_from_google(self, coordinates):
+        """Get location name from Google Maps API with caching."""
+        if coordinates is None:
+            return "no_location"
+        
+        # Check cache first
+        coord_key = f"{coordinates[0]:.4f},{coordinates[1]:.4f}"
+        if coord_key in self.geocoding_cache:
+            return self.geocoding_cache[coord_key]
+        
+        try:
+            import requests
+            import time
+            
+            url = "https://maps.googleapis.com/maps/api/geocode/json"
+            params = {
+                'latlng': f"{coordinates[0]},{coordinates[1]}",
+                'key': self.google_api_key
+            }
+            
+            response = requests.get(url, params=params)
+            time.sleep(0.1)  # Rate limiting
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data['results']:
+                    # Get city/locality from results
+                    address_components = data['results'][0]['address_components']
+                    for component in address_components:
+                        if 'locality' in component['types']:
+                            location_name = component['long_name'].replace(' ', '_')
+                            self.geocoding_cache[coord_key] = location_name
+                            return location_name
+                    
+                    # Fallback to first formatted address component
+                    location_name = data['results'][0]['address_components'][0]['long_name'].replace(' ', '_')
+                    self.geocoding_cache[coord_key] = location_name
+                    return location_name
+        
+        except Exception as e:
+            logger.warning(f"Error with Google API: {e}")
+        
+        # Fallback to coordinate-based name
+        fallback_name = self.get_location_name(coordinates)
+        self.geocoding_cache[coord_key] = fallback_name
+        return fallback_name
+    
     def get_best_location_name(self, coordinates):
-        """Get the best available location name (Google API if available, otherwise coordinates)."""
+        """Get the best available location name."""
         if self.google_api_key:
             return self.get_location_name_from_google(coordinates)
         else:
@@ -220,48 +224,39 @@ class PhotoLocationSorter:
         """Main processing function to sort photos by location."""
         logger.info(f"Starting to process photos in {self.source_folder}")
         
-        # Get all photo files
-        photo_files = [
-            p for p in self.source_folder.iterdir()
-            if p.is_file() and p.suffix.lower() in self.photo_extensions
-        ]
+        # Get all photo files (sorted by modification time as proxy for date)
+        photo_files = sorted(
+            [p for p in self.source_folder.iterdir() 
+             if p.is_file() and p.suffix.lower() in self.photo_extensions],
+            key=lambda x: os.path.getmtime(x)
+        )
         
         if not photo_files:
             logger.warning("No photo files found!")
             return
+        
         num = len(photo_files)
         logger.info(f"Found {num} photos")
-        '''
-        # Extract GPS coordinates for all photos (with progress)
-        logger.info("Extracting GPS coordinates...")
-        for i, photo_path in enumerate(photo_files):
-            if i % 100 == 0:
-                logger.info(f"Processed {i}/{num} photos for GPS data")
-            
-
-            coordinates = self.gps_coordinates_from_tags(self.extract_tags(photo_path))
-            self.location_cache[photo_path] = coordinates
         
-        # Sort photos by date taken for better grouping
-        logger.info("Sorting photos by date...")
-        photo_files.sort(key=lambda x: self.extract_date_taken(x))
-        '''
         # Group photos by location using binary search technique
         logger.info("Grouping photos by location...")
         location_groups = defaultdict(list)
         
         i = 0
+        processed = 0
         while i < len(photo_files):
             group_end = self.find_location_group_end(photo_files, i)
             
             # Get the location for this group
-            location = self.location_cache.get(photo_files[i])
+            location = self.get_location_lazy(photo_files[i])
+            
+            # Get location name once per group (with Google API if available)
+            location_name = self.get_best_location_name(location)
             
             # Add all photos in this group to the location
             for j in range(i, group_end):
                 photo_path = photo_files[j]
-                date_taken = self.extract_date_taken(photo_path)
-                location_name = self.get_location_name(location)
+                date_taken = self.get_date_lazy(photo_path)
                 
                 location_groups[location_name].append({
                     'path': photo_path,
@@ -269,22 +264,11 @@ class PhotoLocationSorter:
                     'coordinates': location
                 })
             
+            processed += (group_end - i)
+            if processed % 100 == 0 or processed == num:
+                logger.info(f"Processed {processed}/{num} photos")
+            
             i = group_end
-        
-        # Now get proper location names using Google API if available
-        if self.google_api_key:
-            logger.info("Getting location names from Google Maps API...")
-            final_groups = defaultdict(list)
-            
-            for location_name, photos in location_groups.items():
-                if photos and photos[0]['coordinates']:
-                    # Use the first photo's coordinates to get the location name
-                    proper_name = self.get_best_location_name(photos[0]['coordinates'])
-                    final_groups[proper_name].extend(photos)
-                else:
-                    final_groups[location_name].extend(photos)
-            
-            location_groups = final_groups
         
         # Create folders and move photos
         logger.info(f"Found {len(location_groups)} location groups")
@@ -321,15 +305,14 @@ class PhotoLocationSorter:
                         # Handle duplicate filenames
                         counter = 1
                         while dest_path.exists():
-                            name_parts = source_path.stem, counter, source_path.suffix
-                            dest_path = folder_path / f"{name_parts[0]}_{name_parts[1]}{name_parts[2]}"
+                            dest_path = folder_path / f"{source_path.stem}_{counter}{source_path.suffix}"
                             counter += 1
                         
                         shutil.move(str(source_path), str(dest_path))
                         moved_count += 1
                         
                     except Exception as e:
-                        logger.error(f"Error moving {source_path}: {e}")
+                        logger.error(f"Error moving {source_path.name}: {e}")
                 
                 logger.info(f"Moved {moved_count} photos to {folder_name}")
 
@@ -344,13 +327,17 @@ def main():
         return
     
     # Optional: Get Google API key for better location names
-    google_api_key = input("Enter Google Maps API key (optional): ").strip()
+    use_google = input("Use Google Maps API for location names? (y/n): ").strip().lower()
+    google_api_key = None
     
-    if google_api_key:
-        print("✓ Will use Google Maps for location names")
+    if use_google == 'y':
+        google_api_key = input("Enter Google Maps API key: ").strip()
+        if google_api_key:
+            print("✓ Will use Google Maps for location names")
+        else:
+            print("✓ No API key provided, using coordinate-based names")
     else:
         print("✓ Will use coordinate-based location names")
-        google_api_key = None
     
     print(f"\nStarting photo sorting process for: {source_folder}")
     print("This may take a while for large photo collections...")
