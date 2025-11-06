@@ -5,7 +5,6 @@ from datetime import datetime
 import exifread
 from pathlib import Path
 import logging
-import time
 
 API_KEY = "YOUR_GOOGLE_MAPS_API_KEY"  # Replace with your actual API key
 
@@ -14,11 +13,26 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class PhotoLocationSorter:
+    """Sorts and organizes photos by date and location.
+
+    This class:
+    - Extracts EXIF GPS and date metadata (with lazy caching)
+    - Groups photos by approximate location using a search-based grouping strategy
+    - Optionally resolves human-readable place names via Google Geocoding API
+    - Creates folders per date and location, then moves photos accordingly
+    """
     photo_extensions = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.raw', '.cr2', '.nef', '.arw', '.heic'}
     
     def __init__(self, source_folder, google_api_key=None):
+        """Initialize the sorter.
+
+        Args:
+            source_folder (str | Path): Path to the folder containing photos.
+            google_api_key (str | None): Optional API key for Google Geocoding.
+                If not provided, falls back to coordinate-based names.
+        """
         self.source_folder = Path(source_folder)
-        self.google_api_key = google_api_key or API_KEY if API_KEY != "YOUR_GOOGLE_MAPS_API_KEY" else None
+        self.google_api_key = google_api_key or (API_KEY if API_KEY != "YOUR_GOOGLE_MAPS_API_KEY" else None)
         
         # Lazy caches - only populated as needed
         self.location_cache = {}  # Cache for GPS coordinates
@@ -26,10 +40,21 @@ class PhotoLocationSorter:
         self.geocoding_cache = {}  # Cache for reverse geocoding results
         
     def _extract_exif_data(self, image_path):
-        """Extract both GPS coordinates and date from EXIF data in a single pass."""
+        """Extract both GPS coordinates and date from EXIF data in a single pass.
+
+        Uses exifread with minimal details to reduce overhead. Coordinates are
+        rounded to 4 decimals to stabilize grouping (~11m).
+
+        Args:
+            image_path (Path): Path to the image.
+
+        Returns:
+            tuple[tuple[float, float] | None, datetime]: (rounded (lat, lon) or None, date_taken).
+                Falls back to file modification time if EXIF date is missing.
+        """
         try:
             with open(image_path, 'rb') as f:
-                # Extract all relevant tags in one pass
+                # Extract all relevant tags in one pass for performance
                 tags = exifread.process_file(
                     f, 
                     details=False, 
@@ -84,7 +109,14 @@ class PhotoLocationSorter:
             return None, datetime.fromtimestamp(os.path.getmtime(image_path))
     
     def get_location_lazy(self, image_path):
-        """Get GPS coordinates with lazy caching."""
+        """Return cached GPS coordinates or extract on demand.
+
+        Args:
+            image_path (Path): Image path.
+
+        Returns:
+            tuple[float, float] | None: Rounded (lat, lon) if available; else None.
+        """
         if image_path not in self.location_cache:
             coordinates, date_taken = self._extract_exif_data(image_path)
             self.location_cache[image_path] = coordinates
@@ -92,7 +124,14 @@ class PhotoLocationSorter:
         return self.location_cache[image_path]
     
     def get_date_lazy(self, image_path):
-        """Get date with lazy caching."""
+        """Return cached date or extract on demand.
+
+        Args:
+            image_path (Path): Image path.
+
+        Returns:
+            datetime: Date/time the photo was taken or file mtime fallback.
+        """
         if image_path not in self.date_cache:
             coordinates, date_taken = self._extract_exif_data(image_path)
             self.location_cache[image_path] = coordinates
@@ -100,13 +139,32 @@ class PhotoLocationSorter:
         return self.date_cache[image_path]
     
     def _convert_to_degrees(self, value):
-        """Convert GPS coordinates from DMS to decimal degrees."""
+        """Convert GPS coordinates from DMS to decimal degrees.
+
+        Args:
+            value: EXIF rational triplet for degrees, minutes, seconds.
+
+        Returns:
+            float: Decimal degrees.
+        """
         d, m, s = value.values
         return float(d) + float(m)/60.0 + float(s)/3600.0
     
     @staticmethod
     def are_locations_same(coord1, coord2, tolerance=0.01):
-        """Check if two GPS coordinates are at the same location within tolerance."""
+        """Heuristically determine if two coordinates represent the same place.
+
+        Compares each component within the given tolerance. If either is None,
+        equality requires both to be None (no-location bucket).
+
+        Args:
+            coord1 (tuple[float, float] | None): First coordinate.
+            coord2 (tuple[float, float] | None): Second coordinate.
+            tolerance (float): Allowed difference in degrees per axis.
+
+        Returns:
+            bool: True if considered the same location.
+        """
         if coord1 is None or coord2 is None:
             return coord1 == coord2  # Both None or one is None
         
@@ -116,7 +174,21 @@ class PhotoLocationSorter:
         return lat_diff <= tolerance and lon_diff <= tolerance
     
     def find_location_group_end(self, photos, start_index):
-        """Use binary search technique to find the end of a location group."""
+        """Find the exclusive end index of a contiguous location group.
+
+        Strategy:
+        - Start from start_index and perform an exponential search (step=8, doubling)
+          to quickly find an upper bound where location changes.
+        - Use binary search within the discovered range to find the first differing index.
+        - Returns the exclusive end index of the group starting at start_index.
+
+        Args:
+            photos (list[Path]): Sorted list of photo paths.
+            start_index (int): Index where the group begins.
+
+        Returns:
+            int: Exclusive end index for the group.
+        """
         if start_index >= len(photos):
             return start_index
         
@@ -129,7 +201,7 @@ class PhotoLocationSorter:
         # Exponential search to find upper bound
         left = start_index + 1
         right = len(photos)
-        step = 8  # Start with 8th photo
+        step = 8  # Start with 8th photo for faster skipping over long same-location runs
         
         current = start_index + step
         while current < len(photos):
@@ -143,7 +215,7 @@ class PhotoLocationSorter:
             step *= 2
             current = start_index + step
         
-        # Binary search between left and right
+        # Binary search between left and right to locate first differing index
         while left < right:
             mid = (left + right) // 2
             mid_location = self.get_location_lazy(photos[mid])
@@ -156,12 +228,18 @@ class PhotoLocationSorter:
         return left
     
     def get_location_name(self, coordinates):
-        """Generate a location name from coordinates (fallback method)."""
+        """Generate a simple coordinate-based name.
+
+        Args:
+            coordinates (tuple[float, float] | None): Rounded (lat, lon).
+
+        Returns:
+            str: e.g., '12.3456N_98.7654E' or 'no_location' if None.
+        """
         if coordinates is None:
             return "no_location"
         
         lat, lon = coordinates
-        # Create a simple location identifier
         lat_dir = "N" if lat >= 0 else "S"
         lon_dir = "E" if lon >= 0 else "W"
         
@@ -169,64 +247,48 @@ class PhotoLocationSorter:
     
 
     def get_location_name_from_google(self, coordinates, prefer_locality=True):
-        """
-        Gets a location name for the given coordinates, using a cache.
-        This method combines the best of both provided functions.
+        """Resolve a human-readable name using Google Geocoding API with caching.
+
+        Prefers city/locality names when available; falls back to formatted address.
+        Results are cached by rounded coordinate string (~11m).
 
         Args:
-            coordinates (tuple): A (latitude, longitude) tuple.
-            prefer_locality (bool): 
-                - If True (default), tries to return the city name (like Function 2).
-                - If False, or if locality isn't found, returns the full
-                  formatted address (like Function 1).
+            coordinates (tuple[float, float]): Rounded (lat, lon).
+            prefer_locality (bool): If True, prefer city/locality when present.
 
         Returns:
-            str: The location name.
-            None: If the location cannot be found or an error occurs.
+            str | None: Resolved location name or None if unavailable/errored.
         """
-        
-        # --- Best of F2: Input Validation ---
         if not coordinates or not all(isinstance(c, (int, float)) for c in coordinates):
             logging.warning("Invalid or missing coordinates provided.")
             return None
         
-        # --- Best of F2: Smart Caching Key ---
-        # Rounds coordinates to ~11 meters, ignoring tiny, irrelevant changes.
         coord_key = f"{coordinates[0]:.4f},{coordinates[1]:.4f}"
         
         if coord_key in self.geocoding_cache:
             return self.geocoding_cache[coord_key]
         
-        # --- Best of F2: Rate Limiting (polite to the API) ---
-        if self.rate_limit_delay > 0:
-            time.sleep(self.rate_limit_delay)
-            
         params = {
             'latlng': f"{coordinates[0]},{coordinates[1]}",
             'key': self.google_api_key
         }
 
-        # --- Best of F1: Robust 3-Layer Error Handling ---
         try:
             import requests
-            response = requests.get(self.base_url, params=params)
+            response = requests.get("https://maps.googleapis.com/maps/api/geocode/json", params=params)
             
-            # 1. Check for HTTP errors (e.g., 404, 500, 403)
             if response.status_code != 200:
                 logging.warning(
                     f"HTTP Error {response.status_code} for {coord_key}: {response.text}"
                 )
-                # Don't cache temporary errors (like 503), let it try again next time
                 return None
 
             data = response.json()
 
-            # 2. Check for Google API status errors (e.g., ZERO_RESULTS, REQUEST_DENIED)
             if data['status'] != 'OK':
                 logging.info(
                     f"API Error for {coord_key}. Status: {data['status']}"
                 )
-                # Cache this result. If it's ZERO_RESULTS, it will always be.
                 self.geocoding_cache[coord_key] = None
                 return None
             
@@ -235,91 +297,48 @@ class PhotoLocationSorter:
                 self.geocoding_cache[coord_key] = None
                 return None
                 
-            # --- Successful API call: Parse the data ---
             first_result = data['results'][0]
             location_name = None
 
-            # --- Best of F2: Try to find 'locality' (city) ---
             if prefer_locality:
                 address_components = first_result.get('address_components', [])
                 for component in address_components:
                     if 'locality' in component['types']:
                         location_name = component['long_name']
-                        break  # Found the city!
+                        break
             
-            # --- Best of F1: Fallback to full 'formatted_address' ---
             if location_name is None:
-                # This is a safer fallback than F2's "first component"
                 location_name = first_result.get('formatted_address')
 
-            # Cache the successful result
             self.geocoding_cache[coord_key] = location_name
             return location_name
 
-        # 3. Check for Network errors (e.g., connection timed out)
         except requests.exceptions.RequestException as e:
             logging.error(f"Geocoding network error for {coord_key}: {e}")
-            # Don't cache this, as it was a temporary network issue.
             return None
 
     
-    '''
-    def get_location_name_from_google(self, coordinates):
-        """Get location name from Google Maps API with caching."""
-        if coordinates is None:
-            return "no_location"
-        
-        # Check cache first
-        coord_key = f"{coordinates[0]:.4f},{coordinates[1]:.4f}"
-        if coord_key in self.geocoding_cache:
-            return self.geocoding_cache[coord_key]
-        
-        try:
-            import requests
-            import time
-            
-            url = "https://maps.googleapis.com/maps/api/geocode/json"
-            params = {
-                'latlng': f"{coordinates[0]},{coordinates[1]}",
-                'key': self.google_api_key
-            }
-            
-            response = requests.get(url, params=params)
-            time.sleep(0.1)  # Rate limiting
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data['results']:
-                    # Get city/locality from results
-                    address_components = data['results'][0]['address_components']
-                    for component in address_components:
-                        if 'locality' in component['types']:
-                            location_name = component['long_name'].replace(' ', '_')
-                            self.geocoding_cache[coord_key] = location_name
-                            return location_name
-                    
-                    # Fallback to first formatted address component
-                    location_name = data['results'][0]['address_components'][0]['long_name'].replace(' ', '_')
-                    self.geocoding_cache[coord_key] = location_name
-                    return location_name
-        
-        except Exception as e:
-            logger.warning(f"Error with Google API: {e}")
-        
-        # Fallback to coordinate-based name
-        fallback_name = self.get_location_name(coordinates)
-        self.geocoding_cache[coord_key] = fallback_name
-        return fallback_name
-    '''
     def get_best_location_name(self, coordinates):
-        """Get the best available location name."""
+        """Return the best available location name.
+
+        Uses the Google Geocoding API if configured; otherwise falls back to
+        coordinate-based naming.
+        """
         if self.google_api_key:
             return self.get_location_name_from_google(coordinates)
         else:
             return self.get_location_name(coordinates)
     
     def process_photos(self):
-        """Main processing function to sort photos by location."""
+        """Sort photos by date and group by location, then move into folders.
+
+        Flow:
+        - Gather candidate photo files by supported extensions
+        - Sort by modification time (proxy for date when EXIF missing)
+        - Group by location using search-based grouping
+        - Resolve location names (API if enabled)
+        - Create date_location folders and move photos
+        """
         logger.info(f"Starting to process photos in {self.source_folder}")
         
         # Get all photo files (sorted by modification time as proxy for date)
@@ -373,8 +392,13 @@ class PhotoLocationSorter:
         self.create_folders_and_move_photos(location_groups)
     
     def create_folders_and_move_photos(self, location_groups):
-        """Create subfolders and move photos based on location and date."""
-        
+        """Create subfolders and move photos based on location and date.
+
+        For each location group:
+        - Partition photos by date (YYYY-MM-DD)
+        - Create a folder named `{date}_{location_name}`
+        - Move photos into the corresponding folder, handling duplicate filenames
+        """
         for location_name, photos in location_groups.items():
             if not photos:
                 continue
@@ -415,7 +439,7 @@ class PhotoLocationSorter:
                 logger.info(f"Moved {moved_count} photos to {folder_name}")
 
 def main():
-    """Main function to run the photo sorter."""
+    """CLI entry point to execute the photo sorter interactively."""
     
     # Get source folder from user
     source_folder = input("Enter the path to your photo dump folder: ").strip()
