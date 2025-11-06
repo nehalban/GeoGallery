@@ -5,6 +5,7 @@ from datetime import datetime
 import exifread
 from pathlib import Path
 import logging
+import time
 
 API_KEY = "YOUR_GOOGLE_MAPS_API_KEY"  # Replace with your actual API key
 
@@ -166,6 +167,103 @@ class PhotoLocationSorter:
         
         return f"{abs(lat):.4f}{lat_dir}_{abs(lon):.4f}{lon_dir}"
     
+
+    def get_location_name_from_google(self, coordinates, prefer_locality=True):
+        """
+        Gets a location name for the given coordinates, using a cache.
+        This method combines the best of both provided functions.
+
+        Args:
+            coordinates (tuple): A (latitude, longitude) tuple.
+            prefer_locality (bool): 
+                - If True (default), tries to return the city name (like Function 2).
+                - If False, or if locality isn't found, returns the full
+                  formatted address (like Function 1).
+
+        Returns:
+            str: The location name.
+            None: If the location cannot be found or an error occurs.
+        """
+        
+        # --- Best of F2: Input Validation ---
+        if not coordinates or not all(isinstance(c, (int, float)) for c in coordinates):
+            logging.warning("Invalid or missing coordinates provided.")
+            return None
+        
+        # --- Best of F2: Smart Caching Key ---
+        # Rounds coordinates to ~11 meters, ignoring tiny, irrelevant changes.
+        coord_key = f"{coordinates[0]:.4f},{coordinates[1]:.4f}"
+        
+        if coord_key in self.geocoding_cache:
+            return self.geocoding_cache[coord_key]
+        
+        # --- Best of F2: Rate Limiting (polite to the API) ---
+        if self.rate_limit_delay > 0:
+            time.sleep(self.rate_limit_delay)
+            
+        params = {
+            'latlng': f"{coordinates[0]},{coordinates[1]}",
+            'key': self.google_api_key
+        }
+
+        # --- Best of F1: Robust 3-Layer Error Handling ---
+        try:
+            import requests
+            response = requests.get(self.base_url, params=params)
+            
+            # 1. Check for HTTP errors (e.g., 404, 500, 403)
+            if response.status_code != 200:
+                logging.warning(
+                    f"HTTP Error {response.status_code} for {coord_key}: {response.text}"
+                )
+                # Don't cache temporary errors (like 503), let it try again next time
+                return None
+
+            data = response.json()
+
+            # 2. Check for Google API status errors (e.g., ZERO_RESULTS, REQUEST_DENIED)
+            if data['status'] != 'OK':
+                logging.info(
+                    f"API Error for {coord_key}. Status: {data['status']}"
+                )
+                # Cache this result. If it's ZERO_RESULTS, it will always be.
+                self.geocoding_cache[coord_key] = None
+                return None
+            
+            if not data.get('results'):
+                logging.info(f"API status OK but no results for {coord_key}")
+                self.geocoding_cache[coord_key] = None
+                return None
+                
+            # --- Successful API call: Parse the data ---
+            first_result = data['results'][0]
+            location_name = None
+
+            # --- Best of F2: Try to find 'locality' (city) ---
+            if prefer_locality:
+                address_components = first_result.get('address_components', [])
+                for component in address_components:
+                    if 'locality' in component['types']:
+                        location_name = component['long_name']
+                        break  # Found the city!
+            
+            # --- Best of F1: Fallback to full 'formatted_address' ---
+            if location_name is None:
+                # This is a safer fallback than F2's "first component"
+                location_name = first_result.get('formatted_address')
+
+            # Cache the successful result
+            self.geocoding_cache[coord_key] = location_name
+            return location_name
+
+        # 3. Check for Network errors (e.g., connection timed out)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Geocoding network error for {coord_key}: {e}")
+            # Don't cache this, as it was a temporary network issue.
+            return None
+
+    
+    '''
     def get_location_name_from_google(self, coordinates):
         """Get location name from Google Maps API with caching."""
         if coordinates is None:
@@ -212,7 +310,7 @@ class PhotoLocationSorter:
         fallback_name = self.get_location_name(coordinates)
         self.geocoding_cache[coord_key] = fallback_name
         return fallback_name
-    
+    '''
     def get_best_location_name(self, coordinates):
         """Get the best available location name."""
         if self.google_api_key:
